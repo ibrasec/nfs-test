@@ -360,13 +360,20 @@ class RpcConnection:
     def __init__(self, host, port, timeout, bind_ip=None):
         self.host, self.port, self.timeout, self.bind_ip = host, port, timeout, bind_ip
         self.sock = None
+        self.connect_error = None
 
     def __enter__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
-        if self.bind_ip:
-            self.sock.bind((self.bind_ip, 0))
-        self.sock.connect((self.host, self.port))
+        try:
+            if self.bind_ip:
+                self.sock.bind((self.bind_ip, 0))
+            self.sock.connect((self.host, self.port))
+        except OSError as e:
+            # Covers socket.timeout, ConnectionRefusedError, etc. — don't raise
+            # out of the `with` block, just remember it so call() can report
+            # it the same way as any other transport_error.
+            self.connect_error = "connect to %s:%d failed: %s" % (self.host, self.port, e)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -376,17 +383,28 @@ class RpcConnection:
             pass
 
     def call(self, ops, auth, tag="probe"):
-        xid = random.randint(1, 0xFFFFFFFF)
-        verf = build_auth_none()
-        body = build_rpc_call(xid, auth, verf, build_compound(tag, ops))
-        self.sock.sendall(frame(body))
-        raw = recv_rpc_reply(self.sock)
-        reply = parse_rpc_reply(raw)
+        if self.connect_error:
+            return {"transport_error": self.connect_error}
+        try:
+            xid = random.randint(1, 0xFFFFFFFF)
+            verf = build_auth_none()
+            body = build_rpc_call(xid, auth, verf, build_compound(tag, ops))
+            self.sock.sendall(frame(body))
+            raw = recv_rpc_reply(self.sock)
+        except OSError as e:
+            return {"transport_error": "socket error during call: %s" % e}
+        try:
+            reply = parse_rpc_reply(raw)
+        except (ValueError, struct.error) as e:
+            return {"transport_error": "malformed RPC reply: %s" % e}
         if reply.get("denied"):
             return {"transport_error": "MSG_DENIED reject_stat=%d" % reply["reject_stat"]}
         if reply["accept_stat"] != 0:
             return {"transport_error": "RPC accept_stat=%d (0=OK,1=PROG_UNAVAIL,2=PROG_MISMATCH,3=PROC_UNAVAIL,4=GARBAGE_ARGS,5=SYSTEM_ERR)" % reply["accept_stat"]}
-        return parse_compound_res(reply["reader"])
+        try:
+            return parse_compound_res(reply["reader"])
+        except (ValueError, struct.error) as e:
+            return {"transport_error": "malformed COMPOUND reply: %s" % e}
 
 
 def run_compound(host, port, timeout, ops, auth, bind_ip=None, tag="probe"):
