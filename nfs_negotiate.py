@@ -619,9 +619,37 @@ def scan_identity(host, port, timeout, path, dimension, values, fixed_uid, fixed
                 continue
 
             granted = result["results"][-1]["data"]["access"]
-            if granted:
-                hits.append((v, granted))
-                print("  %s=%-10d -> ACCESS granted=0x%02x" % (dimension, v, granted))
+            if not granted:
+                continue
+            hits.append((v, granted))
+            print("  %s=%-10d -> ACCESS granted=0x%02x" % (dimension, v, granted))
+
+            getattr_res = result["results"][-2]
+            entry_type = decode_type_size(getattr_res["data"]["bitmap"], getattr_res["data"]["attrs"]).get("type")
+
+            if entry_type == 2 and (granted & ACCESS4_LOOKUP):  # NF4DIR
+                rd_ops = [op_putrootfh()] + [op_lookup(c) for c in components] + [op_readdir(attr_request=[])]
+                rd = conn.call(rd_ops, auth, tag="scan-readdir:%s=%d" % (dimension, v))
+                if "transport_error" in rd:
+                    print("      readdir failed: %s" % rd["transport_error"])
+                elif rd["results"][-1]["status"] != 0:
+                    print("      readdir -> %s" % status_name(rd["results"][-1]["status"]))
+                else:
+                    entries = rd["results"][-1]["data"]["entries"]
+                    print("      %d entries%s:" % (len(entries), "" if rd["results"][-1]["data"]["eof"] else ", truncated"))
+                    for name in entries:
+                        print("        - %s" % name)
+            elif entry_type == 1 and (granted & ACCESS4_READ):  # NF4REG
+                rf_ops = [op_putrootfh()] + [op_lookup(c) for c in components] + [op_read(0, 65536)]
+                rf = conn.call(rf_ops, auth, tag="scan-read:%s=%d" % (dimension, v))
+                if "transport_error" in rf:
+                    print("      read failed: %s" % rf["transport_error"])
+                elif rf["results"][-1]["status"] != 0:
+                    print("      read -> %s" % status_name(rf["results"][-1]["status"]))
+                else:
+                    data = rf["results"][-1]["data"]["data"]
+                    print("      read %d bytes, eof=%s, preview=%r" %
+                          (len(data), rf["results"][-1]["data"]["eof"], data[:200]))
 
     print("--- scan done: %d/%d value(s) granted some access ---" % (len(hits), len(values)))
     return hits
